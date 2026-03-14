@@ -1,16 +1,33 @@
-const corsAnywhere = require("cors-anywhere");
-const zlib = require("zlib");
+const http = require('http');
+const https = require('https');
+const zlib = require('zlib');
+const { URL } = require('url');
 
+const PORT = process.env.PORT || 3000;
+
+// ========== INJECTED SCRIPTS ==========
 const frameBuster = `
 <script>
 (function(){
-  try{
-    Object.defineProperty(window,"top",{get:()=>window});
-    Object.defineProperty(window,"parent",{get:()=>window});
-    Object.defineProperty(window,"frameElement",{get:()=>null});
+  try {
+    // Make Instagram think it's not in an iframe
+    Object.defineProperty(window, 'top', { get: () => window });
+    Object.defineProperty(window, 'parent', { get: () => window });
+    Object.defineProperty(window, 'frameElement', { get: () => null });
     window.self = window;
-    console.log("[proxy] frame check bypass active");
-  }catch(e){}
+
+    // Override window.open to stay inside the iframe
+    const originalOpen = window.open;
+    window.open = function(url, ...args) {
+      if (url && !url.startsWith('#')) {
+        // Redirect inside the iframe instead of opening a new tab
+        location.href = url;
+      }
+      return null;
+    };
+
+    console.log('[Proxy] Framebusting bypass active');
+  } catch(e) {}
 })();
 </script>
 `;
@@ -18,147 +35,217 @@ const frameBuster = `
 const cookieClicker = `
 <script>
 (function(){
-  const phrases=[
-    "Allow all cookies",
-    "Accept All",
-    "Allow essential and optional cookies",
-    "Consent",
-    "Got it",
-    "Aceptar todo",
-    "Tout accepter",
-    "Alle akzeptieren"
+  const phrases = [
+    'Allow all cookies',
+    'Accept All',
+    'Allow essential and optional cookies',
+    'Consent',
+    'Got it',
+    'Aceptar todo',
+    'Tout accepter',
+    'Alle akzeptieren'
   ];
 
-  function run(){
-    let tries=0;
-    const t=setInterval(()=>{
-      const btns=document.querySelectorAll("button,div[role=button],a");
-      for(const b of btns){
-        const txt=(b.innerText||"").trim();
-        if(phrases.some(p=>txt.includes(p))){
-          b.click();
-          clearInterval(t);
-          console.log("[proxy] cookie accepted");
-          return;
-        }
+  function tryClick() {
+    const buttons = document.querySelectorAll('button, div[role="button"], a');
+    for (const btn of buttons) {
+      const text = (btn.innerText || '').trim();
+      if (phrases.some(p => text.includes(p))) {
+        btn.click();
+        console.log('[Proxy] Cookie button clicked');
+        return true;
       }
-      if(++tries>20) clearInterval(t);
-    },1000);
+    }
+    return false;
   }
 
-  if(document.readyState==="loading"){
-    document.addEventListener("DOMContentLoaded",run);
-  }else{
-    run();
-  }
+  // Try multiple times
+  let attempts = 0;
+  const interval = setInterval(() => {
+    if (tryClick() || attempts++ > 20) clearInterval(interval);
+  }, 1000);
 })();
 </script>
 `;
 
-function decompress(buffer, enc) {
-  if (enc === "gzip") return zlib.gunzipSync(buffer).toString();
-  if (enc === "deflate") return zlib.inflateSync(buffer).toString();
+// ========== HELPER FUNCTIONS ==========
+function decompress(buffer, encoding) {
+  if (encoding === 'gzip') return zlib.gunzipSync(buffer).toString();
+  if (encoding === 'deflate') return zlib.inflateSync(buffer).toString();
+  if (encoding === 'br') return zlib.brotliDecompressSync(buffer).toString();
   return buffer.toString();
 }
 
-function compress(data, enc) {
-  if (enc === "gzip") return zlib.gzipSync(data);
-  if (enc === "deflate") return zlib.deflateSync(data);
-  return Buffer.from(data);
+function compress(text, encoding) {
+  const buf = Buffer.from(text);
+  if (encoding === 'gzip') return zlib.gzipSync(buf);
+  if (encoding === 'deflate') return zlib.deflateSync(buf);
+  if (encoding === 'br') return zlib.brotliCompressSync(buf);
+  return buf;
 }
 
-function inject(html) {
-
-  if (html.includes("<head")) {
-    html = html.replace(/<head[^>]*>/i, m => m + frameBuster);
-  } else {
+function rewriteHtml(html, baseUrl) {
+  // Inject scripts
+  html = html.replace('<head>', '<head>' + frameBuster);
+  if (!html.includes(frameBuster)) {
     html = frameBuster + html;
   }
+  html = html.replace('</body>', cookieClicker + '</body>');
 
-  if (html.includes("</body>")) {
-    html = html.replace("</body>", cookieClicker + "</body>");
-  } else {
-    html += cookieClicker;
-  }
+  // Rewrite relative URLs in HTML attributes
+  const urlRegex = /(href|src|action|data)=["']([^"']*)["']/gi;
+  html = html.replace(urlRegex, (match, attr, url) => {
+    if (url.startsWith('http') || url.startsWith('//') || url.startsWith('#')) {
+      return match; // absolute or protocol-relative or anchor
+    }
+    if (url.startsWith('/')) {
+      // Root-relative
+      const absolute = new URL(url, baseUrl).href;
+      return `${attr}="${absolute}"`;
+    }
+    // Relative to current path
+    const absolute = new URL(url, baseUrl).href;
+    return `${attr}="${absolute}"`;
+  });
+
+  // Also rewrite in inline styles (background-image etc.) – simplified
+  html = html.replace(/url\(['"]?([^'"\)]*)['"]?\)/gi, (match, url) => {
+    if (url.startsWith('data:') || url.startsWith('http') || url.startsWith('//')) return match;
+    const absolute = new URL(url, baseUrl).href;
+    return `url('${absolute}')`;
+  });
 
   return html;
 }
 
-const proxy = corsAnywhere.createServer({
+function rewriteCss(css, baseUrl) {
+  return css.replace(/url\(['"]?([^'"\)]*)['"]?\)/gi, (match, url) => {
+    if (url.startsWith('data:') || url.startsWith('http') || url.startsWith('//')) return match;
+    const absolute = new URL(url, baseUrl).href;
+    return `url('${absolute}')`;
+  });
+}
 
-  originWhitelist: [],
-  requireHeader: [],
+function rewriteJs(js, baseUrl) {
+  // This is tricky – we can attempt to rewrite strings that look like relative URLs in fetch/XHR,
+  // but it's easy to break things. Instead, we'll inject a patch at the top of JS responses.
+  const patch = `
+  (function(){
+    // Patch fetch and XHR to use absolute URLs via proxy
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+      if (typeof url === 'string' && !url.startsWith('http') && !url.startsWith('//')) {
+        url = new URL(url, location.origin).href;
+      }
+      return originalFetch.call(this, url, options);
+    };
+    const XHR = XMLHttpRequest;
+    const originalOpen = XHR.prototype.open;
+    XHR.prototype.open = function(method, url, ...args) {
+      if (typeof url === 'string' && !url.startsWith('http') && !url.startsWith('//')) {
+        url = new URL(url, location.origin).href;
+      }
+      return originalOpen.call(this, method, url, ...args);
+    };
+  })();
+  `;
+  return patch + '\n' + js;
+}
 
-  removeHeaders: [
-    "x-frame-options",
-    "content-security-policy",
-    "x-xss-protection",
-    "x-content-type-options"
-  ],
-
-  setHeaders: {
-    "Access-Control-Allow-Origin": "*",
-    "X-Frame-Options": "ALLOWALL"
-  },
-
-  handleResponse: (req,res,proxyRes)=>{
-
-    const headers={...proxyRes.headers};
-
-    delete headers["x-frame-options"];
-    delete headers["content-security-policy"];
-    delete headers["content-length"];
-
-    headers["Access-Control-Allow-Origin"]="*";
-    headers["X-Frame-Options"]="ALLOWALL";
-
-    const type=headers["content-type"]||"";
-
-    if(type.includes("text/html")){
-
-      const chunks=[];
-      const enc=headers["content-encoding"];
-
-      proxyRes.on("data",c=>chunks.push(c));
-
-      proxyRes.on("end",()=>{
-
-        try{
-
-          const body=Buffer.concat(chunks);
-          let html=decompress(body,enc);
-
-          html=inject(html);
-
-          const out=compress(html,enc);
-
-          headers["content-length"]=out.length;
-
-          res.writeHead(proxyRes.statusCode,headers);
-          res.end(out);
-
-        }catch(e){
-
-          res.writeHead(proxyRes.statusCode,headers);
-          res.end(Buffer.concat(chunks));
-
-        }
-
-      });
-
-    }else{
-
-      res.writeHead(proxyRes.statusCode,headers);
-      proxyRes.pipe(res);
-
-    }
-
+// ========== PROXY SERVER ==========
+const server = http.createServer((req, res) => {
+  const targetUrl = req.url.slice(1); // remove leading '/'
+  if (!targetUrl.startsWith('http')) {
+    res.writeHead(400);
+    res.end('Please provide a full URL, e.g. /https://www.instagram.com');
+    return;
   }
 
+  const parsed = new URL(targetUrl);
+  const client = parsed.protocol === 'https:' ? https : http;
+
+  const options = {
+    hostname: parsed.hostname,
+    path: parsed.pathname + parsed.search + parsed.hash,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: parsed.host,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      'Accept-Encoding': 'gzip, deflate, br', // let origin decide encoding
+    },
+  };
+  // Remove headers that could cause issues
+  delete options.headers['x-forwarded-for'];
+  delete options.headers['x-forwarded-proto'];
+  delete options.headers['x-forwarded-host'];
+
+  const proxyReq = client.request(options, (proxyRes) => {
+    // Read response body
+    const chunks = [];
+    proxyRes.on('data', chunk => chunks.push(chunk));
+    proxyRes.on('end', () => {
+      let body = Buffer.concat(chunks);
+      const contentType = proxyRes.headers['content-type'] || '';
+      const contentEncoding = proxyRes.headers['content-encoding'];
+
+      // Decompress if needed
+      let decodedBody;
+      try {
+        decodedBody = decompress(body, contentEncoding);
+      } catch (e) {
+        decodedBody = body.toString(); // fallback
+      }
+
+      // Rewrite based on content type
+      if (contentType.includes('text/html')) {
+        decodedBody = rewriteHtml(decodedBody, targetUrl);
+      } else if (contentType.includes('text/css')) {
+        decodedBody = rewriteCss(decodedBody, targetUrl);
+      } else if (contentType.includes('javascript')) {
+        decodedBody = rewriteJs(decodedBody, targetUrl);
+      }
+
+      // Recompress if original was compressed
+      let finalBody;
+      let finalEncoding = contentEncoding;
+      if (contentEncoding && contentEncoding !== 'identity') {
+        finalBody = compress(decodedBody, contentEncoding);
+      } else {
+        finalBody = Buffer.from(decodedBody);
+        finalEncoding = undefined;
+      }
+
+      // Build response headers (strip blocking ones)
+      const headers = { ...proxyRes.headers };
+      delete headers['x-frame-options'];
+      delete headers['content-security-policy'];
+      delete headers['x-xss-protection'];
+      delete headers['x-content-type-options'];
+      delete headers['content-length'];
+      headers['access-control-allow-origin'] = '*';
+      headers['x-frame-options'] = 'ALLOWALL';
+      if (finalEncoding) headers['content-encoding'] = finalEncoding;
+      headers['content-length'] = finalBody.length;
+
+      res.writeHead(proxyRes.statusCode, headers);
+      res.end(finalBody);
+    });
+  });
+
+  proxyReq.on('error', (err) => {
+    res.writeHead(500);
+    res.end('Proxy error: ' + err.message);
+  });
+
+  // Pipe request body if any (e.g., POST)
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    req.pipe(proxyReq);
+  } else {
+    proxyReq.end();
+  }
 });
 
-const PORT=process.env.PORT||3000;
-
-proxy.listen(PORT,()=>{
-  console.log("proxy running on port "+PORT);
+server.listen(PORT, () => {
+  console.log(`Ultimate Instagram proxy running on port ${PORT}`);
 });
