@@ -1,9 +1,31 @@
 const corsAnywhere = require('cors-anywhere');
 const zlib = require('zlib');
 
-// ===== INJECTED SCRIPT =====
-// Automatically clicks the Instagram cookie consent button
-const injectScript = `
+// ===== INJECTED SCRIPTS =====
+// 1. Framebusting buster – tricks Instagram into thinking it's not in an iframe
+const framebustBuster = `
+<script>
+  // Override window.top and window.parent before Instagram checks them
+  (function() {
+    // Must run as early as possible – this will be inserted at the top of <head>
+    Object.defineProperty(window, 'top', {
+      get: function() { return window; }
+    });
+    Object.defineProperty(window, 'parent', {
+      get: function() { return window; }
+    });
+    Object.defineProperty(window, 'frameElement', {
+      get: function() { return null; }
+    });
+    // Also override self if needed
+    window.self = window;
+    console.log('[Proxy] Framebusting buster installed');
+  })();
+</script>
+`;
+
+// 2. Cookie auto‑clicker
+const cookieClicker = `
 <script>
   (function autoAcceptCookies() {
     function run() {
@@ -11,11 +33,11 @@ const injectScript = `
         'Allow all cookies',
         'Accept All',
         'Allow essential and optional cookies',
+        'Consent',
+        'Got it',
         'Aceptar todo',
         'Tout accepter',
-        'Alle akzeptieren',
-        'Consent',
-        'Got it'
+        'Alle akzeptieren'
       ];
       
       let attempts = 0;
@@ -44,7 +66,7 @@ const injectScript = `
 </script>
 `;
 
-// Helper to inject script into HTML (handles gzip/deflate)
+// Helper to inject scripts into HTML (handles gzip/deflate)
 function injectIntoHtml(body, encoding, callback) {
   let content;
   if (encoding === 'gzip') {
@@ -55,12 +77,17 @@ function injectIntoHtml(body, encoding, callback) {
     content = body.toString();
   }
 
-  // Inject right before </head> (fallback to </body>)
-  let modified = content.replace('</head>', injectScript + '</head>');
+  // Inject framebust buster at the very beginning of <head> (or create <head> if missing)
+  // Then inject cookie clicker before </body>
+  let modified = content.replace('<head>', '<head>' + framebustBuster);
   if (modified === content) {
-    modified = content.replace('</body>', injectScript + '</body>');
+    // If no <head> tag, add one at the start
+    modified = framebustBuster + content;
   }
-
+  
+  // Inject cookie clicker before </body>
+  modified = modified.replace('</body>', cookieClicker + '</body>');
+  
   // Re-compress if needed
   if (encoding === 'gzip') {
     callback(null, zlib.gzipSync(modified), 'gzip');
@@ -73,34 +100,32 @@ function injectIntoHtml(body, encoding, callback) {
 
 // Create the proxy server with aggressive header stripping
 const server = corsAnywhere.createServer({
-  originWhitelist: [],            // Allow any origin
-  requireHeader: [],              // No special headers needed
-  removeHeaders: [                // Remove blocking headers from the response
+  originWhitelist: [],
+  requireHeader: [],
+  removeHeaders: [
     'x-frame-options',
     'content-security-policy',
     'x-xss-protection',
     'x-content-type-options'
   ],
   setHeaders: {
-    'Access-Control-Allow-Origin': '*',   // Allow any site to embed
-    'X-Frame-Options': 'ALLOWALL'         // Override any remaining frame restrictions
+    'Access-Control-Allow-Origin': '*',
+    'X-Frame-Options': 'ALLOWALL'
   },
-  // Handle every response to inject script and force headers
   handleResponse: (req, res, proxyRes) => {
-    // Clone and sanitize headers for EVERY response (HTML or not)
+    // Clone and sanitize headers
     const headers = { ...proxyRes.headers };
     delete headers['x-frame-options'];
     delete headers['content-security-policy'];
     delete headers['x-xss-protection'];
     delete headers['x-content-type-options'];
-    delete headers['content-length'];          // will be set automatically later
+    delete headers['content-length'];
     headers['Access-Control-Allow-Origin'] = '*';
     headers['X-Frame-Options'] = 'ALLOWALL';
 
     const contentType = proxyRes.headers['content-type'] || '';
 
     if (contentType.includes('text/html')) {
-      // For HTML, inject the script
       const chunks = [];
       const contentEncoding = proxyRes.headers['content-encoding'];
 
@@ -109,7 +134,6 @@ const server = corsAnywhere.createServer({
         const bodyBuffer = Buffer.concat(chunks);
         injectIntoHtml(bodyBuffer, contentEncoding, (err, newBody, newEncoding) => {
           if (err) {
-            // Fallback: send original (but with stripped headers)
             res.writeHead(proxyRes.statusCode, headers);
             res.end(bodyBuffer);
             return;
@@ -120,7 +144,6 @@ const server = corsAnywhere.createServer({
         });
       });
     } else {
-      // Not HTML – just pass through with sanitized headers
       res.writeHead(proxyRes.statusCode, headers);
       proxyRes.pipe(res);
     }
@@ -129,5 +152,5 @@ const server = corsAnywhere.createServer({
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`✅ Aggressive proxy running on port ${PORT}`);
+  console.log(`✅ Proxy with framebust buster running on port ${PORT}`);
 });
