@@ -1,156 +1,164 @@
-const corsAnywhere = require('cors-anywhere');
-const zlib = require('zlib');
+const corsAnywhere = require("cors-anywhere");
+const zlib = require("zlib");
 
-// ===== INJECTED SCRIPTS =====
-// 1. Framebusting buster – tricks Instagram into thinking it's not in an iframe
-const framebustBuster = `
+const frameBuster = `
 <script>
-  // Override window.top and window.parent before Instagram checks them
-  (function() {
-    // Must run as early as possible – this will be inserted at the top of <head>
-    Object.defineProperty(window, 'top', {
-      get: function() { return window; }
-    });
-    Object.defineProperty(window, 'parent', {
-      get: function() { return window; }
-    });
-    Object.defineProperty(window, 'frameElement', {
-      get: function() { return null; }
-    });
-    // Also override self if needed
+(function(){
+  try{
+    Object.defineProperty(window,"top",{get:()=>window});
+    Object.defineProperty(window,"parent",{get:()=>window});
+    Object.defineProperty(window,"frameElement",{get:()=>null});
     window.self = window;
-    console.log('[Proxy] Framebusting buster installed');
-  })();
+    console.log("[proxy] frame check bypass active");
+  }catch(e){}
+})();
 </script>
 `;
 
-// 2. Cookie auto‑clicker
 const cookieClicker = `
 <script>
-  (function autoAcceptCookies() {
-    function run() {
-      const possibleTexts = [
-        'Allow all cookies',
-        'Accept All',
-        'Allow essential and optional cookies',
-        'Consent',
-        'Got it',
-        'Aceptar todo',
-        'Tout accepter',
-        'Alle akzeptieren'
-      ];
-      
-      let attempts = 0;
-      const interval = setInterval(() => {
-        const buttons = document.querySelectorAll('button, div[role="button"], a, ._a9--, ._a9-z');
-        for (let btn of buttons) {
-          const text = btn.innerText?.trim() || '';
-          if (possibleTexts.some(phrase => text.includes(phrase))) {
-            btn.click();
-            console.log('[Proxy] Cookie button clicked');
-            clearInterval(interval);
-            return;
-          }
-        }
-        attempts++;
-        if (attempts > 15) clearInterval(interval);
-      }, 1000);
-    }
+(function(){
+  const phrases=[
+    "Allow all cookies",
+    "Accept All",
+    "Allow essential and optional cookies",
+    "Consent",
+    "Got it",
+    "Aceptar todo",
+    "Tout accepter",
+    "Alle akzeptieren"
+  ];
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', run);
-    } else {
-      run();
-    }
-  })();
+  function run(){
+    let tries=0;
+    const t=setInterval(()=>{
+      const btns=document.querySelectorAll("button,div[role=button],a");
+      for(const b of btns){
+        const txt=(b.innerText||"").trim();
+        if(phrases.some(p=>txt.includes(p))){
+          b.click();
+          clearInterval(t);
+          console.log("[proxy] cookie accepted");
+          return;
+        }
+      }
+      if(++tries>20) clearInterval(t);
+    },1000);
+  }
+
+  if(document.readyState==="loading"){
+    document.addEventListener("DOMContentLoaded",run);
+  }else{
+    run();
+  }
+})();
 </script>
 `;
 
-// Helper to inject scripts into HTML (handles gzip/deflate)
-function injectIntoHtml(body, encoding, callback) {
-  let content;
-  if (encoding === 'gzip') {
-    content = zlib.gunzipSync(body).toString();
-  } else if (encoding === 'deflate') {
-    content = zlib.inflateSync(body).toString();
-  } else {
-    content = body.toString();
-  }
-
-  // Inject framebust buster at the very beginning of <head> (or create <head> if missing)
-  // Then inject cookie clicker before </body>
-  let modified = content.replace('<head>', '<head>' + framebustBuster);
-  if (modified === content) {
-    // If no <head> tag, add one at the start
-    modified = framebustBuster + content;
-  }
-  
-  // Inject cookie clicker before </body>
-  modified = modified.replace('</body>', cookieClicker + '</body>');
-  
-  // Re-compress if needed
-  if (encoding === 'gzip') {
-    callback(null, zlib.gzipSync(modified), 'gzip');
-  } else if (encoding === 'deflate') {
-    callback(null, zlib.deflateSync(modified), 'deflate');
-  } else {
-    callback(null, modified, null);
-  }
+function decompress(buffer, enc) {
+  if (enc === "gzip") return zlib.gunzipSync(buffer).toString();
+  if (enc === "deflate") return zlib.inflateSync(buffer).toString();
+  return buffer.toString();
 }
 
-// Create the proxy server with aggressive header stripping
-const server = corsAnywhere.createServer({
+function compress(data, enc) {
+  if (enc === "gzip") return zlib.gzipSync(data);
+  if (enc === "deflate") return zlib.deflateSync(data);
+  return Buffer.from(data);
+}
+
+function inject(html) {
+
+  if (html.includes("<head")) {
+    html = html.replace(/<head[^>]*>/i, m => m + frameBuster);
+  } else {
+    html = frameBuster + html;
+  }
+
+  if (html.includes("</body>")) {
+    html = html.replace("</body>", cookieClicker + "</body>");
+  } else {
+    html += cookieClicker;
+  }
+
+  return html;
+}
+
+const proxy = corsAnywhere.createServer({
+
   originWhitelist: [],
   requireHeader: [],
+
   removeHeaders: [
-    'x-frame-options',
-    'content-security-policy',
-    'x-xss-protection',
-    'x-content-type-options'
+    "x-frame-options",
+    "content-security-policy",
+    "x-xss-protection",
+    "x-content-type-options"
   ],
+
   setHeaders: {
-    'Access-Control-Allow-Origin': '*',
-    'X-Frame-Options': 'ALLOWALL'
+    "Access-Control-Allow-Origin": "*",
+    "X-Frame-Options": "ALLOWALL"
   },
-  handleResponse: (req, res, proxyRes) => {
-    // Clone and sanitize headers
-    const headers = { ...proxyRes.headers };
-    delete headers['x-frame-options'];
-    delete headers['content-security-policy'];
-    delete headers['x-xss-protection'];
-    delete headers['x-content-type-options'];
-    delete headers['content-length'];
-    headers['Access-Control-Allow-Origin'] = '*';
-    headers['X-Frame-Options'] = 'ALLOWALL';
 
-    const contentType = proxyRes.headers['content-type'] || '';
+  handleResponse: (req,res,proxyRes)=>{
 
-    if (contentType.includes('text/html')) {
-      const chunks = [];
-      const contentEncoding = proxyRes.headers['content-encoding'];
+    const headers={...proxyRes.headers};
 
-      proxyRes.on('data', chunk => chunks.push(chunk));
-      proxyRes.on('end', () => {
-        const bodyBuffer = Buffer.concat(chunks);
-        injectIntoHtml(bodyBuffer, contentEncoding, (err, newBody, newEncoding) => {
-          if (err) {
-            res.writeHead(proxyRes.statusCode, headers);
-            res.end(bodyBuffer);
-            return;
-          }
-          if (newEncoding) headers['content-encoding'] = newEncoding;
-          res.writeHead(proxyRes.statusCode, headers);
-          res.end(newBody);
-        });
+    delete headers["x-frame-options"];
+    delete headers["content-security-policy"];
+    delete headers["content-length"];
+
+    headers["Access-Control-Allow-Origin"]="*";
+    headers["X-Frame-Options"]="ALLOWALL";
+
+    const type=headers["content-type"]||"";
+
+    if(type.includes("text/html")){
+
+      const chunks=[];
+      const enc=headers["content-encoding"];
+
+      proxyRes.on("data",c=>chunks.push(c));
+
+      proxyRes.on("end",()=>{
+
+        try{
+
+          const body=Buffer.concat(chunks);
+          let html=decompress(body,enc);
+
+          html=inject(html);
+
+          const out=compress(html,enc);
+
+          headers["content-length"]=out.length;
+
+          res.writeHead(proxyRes.statusCode,headers);
+          res.end(out);
+
+        }catch(e){
+
+          res.writeHead(proxyRes.statusCode,headers);
+          res.end(Buffer.concat(chunks));
+
+        }
+
       });
-    } else {
-      res.writeHead(proxyRes.statusCode, headers);
+
+    }else{
+
+      res.writeHead(proxyRes.statusCode,headers);
       proxyRes.pipe(res);
+
     }
+
   }
+
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`✅ Proxy with framebust buster running on port ${PORT}`);
+const PORT=process.env.PORT||3000;
+
+proxy.listen(PORT,()=>{
+  console.log("proxy running on port "+PORT);
 });
