@@ -1,51 +1,53 @@
 const corsAnywhere = require('cors-anywhere');
 const zlib = require('zlib');
 
-// The script that will be injected into every HTML page
+// The script that will be injected into every HTML page to auto‑click the cookie button
 const injectScript = `
 <script>
   (function autoAcceptCookies() {
-    // Wait for the page to load
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', run);
-    } else {
-      run();
-    }
     function run() {
-      // Look for the "Allow all cookies" button – Instagram's button often has these texts
-      const possibleButtons = [
+      // Common button texts used by Instagram's cookie consent
+      const possibleTexts = [
         'Allow all cookies',
         'Accept All',
         'Allow essential and optional cookies',
-        'Aceptar todo',        // Spanish
-        'Tout accepter',       // French
-        'Alle akzeptieren'     // German
+        'Aceptar todo',
+        'Tout accepter',
+        'Alle akzeptieren',
+        'Consent',
+        'Got it'
       ];
       
-      // Try to find and click the button every second for 10 seconds
+      // Try to find and click the button every second for 15 seconds
       let attempts = 0;
       const interval = setInterval(() => {
-        const buttons = document.querySelectorAll('button, div[role="button"], a');
+        const buttons = document.querySelectorAll('button, div[role="button"], a, ._a9--, ._a9-z');
         for (let btn of buttons) {
           const text = btn.innerText?.trim() || '';
-          if (possibleButtons.some(phrase => text.includes(phrase))) {
+          if (possibleTexts.some(phrase => text.includes(phrase))) {
             btn.click();
-            console.log('Cookie button clicked!');
+            console.log('[Proxy] Cookie button clicked');
             clearInterval(interval);
             return;
           }
         }
         attempts++;
-        if (attempts > 10) clearInterval(interval); // stop after 10 seconds
+        if (attempts > 15) clearInterval(interval);
       }, 1000);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', run);
+    } else {
+      run();
     }
   })();
 </script>
 `;
 
-// Helper to inject script into HTML responses
+// Helper to inject the script into HTML responses (handles gzip/deflate)
 function injectIntoHtml(body, encoding, callback) {
-  let content = body;
+  let content;
   if (encoding === 'gzip') {
     content = zlib.gunzipSync(body).toString();
   } else if (encoding === 'deflate') {
@@ -54,12 +56,13 @@ function injectIntoHtml(body, encoding, callback) {
     content = body.toString();
   }
 
-  // Inject the script right before </head> or </body>
+  // Inject right before </head> (fallback to </body>)
   let modified = content.replace('</head>', injectScript + '</head>');
-  if (modified === content) { // if no </head>, try </body>
+  if (modified === content) {
     modified = content.replace('</body>', injectScript + '</body>');
   }
 
+  // Re‑compress if needed
   if (encoding === 'gzip') {
     callback(null, zlib.gzipSync(modified), 'gzip');
   } else if (encoding === 'deflate') {
@@ -71,19 +74,23 @@ function injectIntoHtml(body, encoding, callback) {
 
 // Create the proxy server
 const server = corsAnywhere.createServer({
-  originWhitelist: [], // Allow all origins
-  requireHeader: [],   // No required headers
-  removeHeaders: ['x-frame-options', 'content-security-policy', 'x-xss-protection'],
-  // Modify response if it's HTML
+  originWhitelist: [],            // Allow any site to embed
+  requireHeader: [],              // No special headers needed
+  removeHeaders: [
+    'x-frame-options',
+    'content-security-policy',
+    'x-xss-protection'
+  ],
+  // Intercept HTML responses to inject our script
   handleResponse: (req, res, proxyRes) => {
     const contentType = proxyRes.headers['content-type'] || '';
     if (contentType.includes('text/html')) {
-      const originalBody = [];
+      const chunks = [];
       const contentEncoding = proxyRes.headers['content-encoding'];
 
-      proxyRes.on('data', chunk => originalBody.push(chunk));
+      proxyRes.on('data', chunk => chunks.push(chunk));
       proxyRes.on('end', () => {
-        const bodyBuffer = Buffer.concat(originalBody);
+        const bodyBuffer = Buffer.concat(chunks);
         injectIntoHtml(bodyBuffer, contentEncoding, (err, newBody, newEncoding) => {
           if (err) {
             // Fallback: send original response
@@ -91,7 +98,7 @@ const server = corsAnywhere.createServer({
             res.end(bodyBuffer);
             return;
           }
-          // Update content-length
+          // Update headers (remove content-length, set new encoding)
           const headers = { ...proxyRes.headers };
           delete headers['content-length'];
           if (newEncoding) headers['content-encoding'] = newEncoding;
@@ -100,7 +107,7 @@ const server = corsAnywhere.createServer({
         });
       });
     } else {
-      // Not HTML – pass through
+      // Not HTML – pass through unchanged
       proxyRes.pipe(res);
     }
   }
@@ -108,5 +115,5 @@ const server = corsAnywhere.createServer({
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Instagram proxy running on port ${PORT}`);
+  console.log(`✅ Instagram proxy running on port ${PORT}`);
 });
