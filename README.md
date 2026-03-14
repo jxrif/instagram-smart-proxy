@@ -1,1 +1,0 @@
-# instagram-smart-proxy
